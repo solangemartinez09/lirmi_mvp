@@ -1,10 +1,14 @@
 import streamlit as st
 import pandas as pd
+import os, tempfile
 from sqlalchemy import create_engine, text
 from datetime import datetime
 
-engine = create_engine("sqlite:///school.db", future=True)
+# DB en carpeta escribible (funciona en Streamlit Cloud y local)
+DB_PATH = os.path.join(tempfile.gettempdir(), "school.db")
+engine = create_engine(f"sqlite:///{DB_PATH}", future=True)
 
+# Crear tablas si no existen
 with engine.begin() as conn:
     conn.execute(text("""
         CREATE TABLE IF NOT EXISTS students (
@@ -14,7 +18,7 @@ with engine.begin() as conn:
         );
     """))
 
-st.title("Lirmi MVP - Sanity Check")
+st.title("Lirmi MVP - Sanity Check (/tmp DB)")
 name = st.text_input("Nombre del estudiante")
 
 if st.button("Agregar") and name.strip():
