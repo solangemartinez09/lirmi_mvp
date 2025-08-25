@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 from sqlalchemy import create_engine, text
 from datetime import datetime, date
-<<<<<<< HEAD
+ HEAD
 
 DB_PATH = "school.db"
 engine = create_engine(f"sqlite:///{DB_PATH}", future=True)
