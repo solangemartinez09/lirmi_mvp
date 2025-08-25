@@ -1,8 +1,29 @@
 import streamlit as st
 import pandas as pd
-import os, tempfile
+import os, tempfile, io
 from sqlalchemy import create_engine, text
 from datetime import datetime, date
+
+# === Config escala chilena desde sidebar ===
+def get_scale():
+    min_note = st.sidebar.number_input("Nota mínima", 1.0, 7.0, 1.0, 0.1)
+    pass_pct = st.sidebar.number_input("Porcentaje para 4.0", 1, 99, 60, 1)
+    max_note = st.sidebar.number_input("Nota máxima", min_note, 7.0, 7.0, 0.1)
+    return min_note, pass_pct, max_note
+
+def pct_to_chilean(pct, min_note=1.0, pass_pct=60, max_note=7.0):
+    pct = max(0.0, min(100.0, float(pct)))
+    if pct >= pass_pct:
+        # Mapea lineal: pass_pct -> 4.0, 100 -> max_note
+        if 100 - pass_pct == 0:
+            return 4.0
+        val = 4.0 + (pct - pass_pct) * (max_note - 4.0) / (100 - pass_pct)
+    else:
+        # Mapea lineal: 0 -> min_note, pass_pct -> 4.0
+        if pass_pct == 0:
+            return min_note
+        val = min_note + (pct) * (4.0 - min_note) / (pass_pct)
+    return round(max(min_note, min(max_note, val)), 1)
 
 # --- DB en carpeta escribible (válido en Streamlit Cloud) ---
 DB_PATH = os.path.join(tempfile.gettempdir(), "school.db")
@@ -19,15 +40,13 @@ def ensure_tables():
             last_name TEXT NOT NULL,
             email TEXT,
             created_at TEXT
-        );
-        """))
+        );"""))
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS subjects(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             code TEXT UNIQUE NOT NULL,
             name TEXT NOT NULL
-        );
-        """))
+        );"""))
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS enrollments(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -37,8 +56,7 @@ def ensure_tables():
             UNIQUE(student_id,subject_id,year),
             FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,
             FOREIGN KEY(subject_id) REFERENCES subjects(id) ON DELETE CASCADE
-        );
-        """))
+        );"""))
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS assessments(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,8 +66,7 @@ def ensure_tables():
             max_score REAL DEFAULT 100.0,
             weight REAL DEFAULT 1.0,
             FOREIGN KEY(subject_id) REFERENCES subjects(id) ON DELETE CASCADE
-        );
-        """))
+        );"""))
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS grades(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,8 +76,33 @@ def ensure_tables():
             UNIQUE(enrollment_id,assessment_id),
             FOREIGN KEY(enrollment_id) REFERENCES enrollments(id) ON DELETE CASCADE,
             FOREIGN KEY(assessment_id) REFERENCES assessments(id) ON DELETE CASCADE
-        );
-        """))
+        );"""))
+        # --- Nuevas tablas para cursos ---
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS courses(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            year INTEGER NOT NULL,
+            UNIQUE(name, year)
+        );"""))
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS course_subjects(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            course_id INTEGER NOT NULL,
+            subject_id INTEGER NOT NULL,
+            UNIQUE(course_id, subject_id),
+            FOREIGN KEY(course_id) REFERENCES courses(id) ON DELETE CASCADE,
+            FOREIGN KEY(subject_id) REFERENCES subjects(id) ON DELETE CASCADE
+        );"""))
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS student_courses(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id INTEGER NOT NULL,
+            course_id INTEGER NOT NULL,
+            UNIQUE(student_id, course_id),
+            FOREIGN KEY(student_id) REFERENCES students(id) ON DELETE CASCADE,
+            FOREIGN KEY(course_id) REFERENCES courses(id) ON DELETE CASCADE
+        );"""))
 
 def q(sql, params=None):
     with engine.begin() as conn:
@@ -74,7 +116,7 @@ def exec_sql(sql, params=None):
     with engine.begin() as conn:
         conn.execute(text(sql), params or {})
 
-# --- PANTALLAS ---
+# --- PANTALLAS BÁSICAS (ya existentes) ---
 def ui_students():
     st.header("Estudiantes")
     with st.expander("Agregar / Editar / Eliminar", expanded=True):
@@ -215,7 +257,6 @@ def ui_assessments():
 
 def ui_grades():
     st.header("Notas")
-    # Elegir año y asignatura para simplificar la carga
     years = q("SELECT DISTINCT year FROM enrollments ORDER BY year DESC")
     subjects = q("SELECT id, name FROM subjects ORDER BY name ASC")
     if years.empty or subjects.empty:
@@ -225,7 +266,6 @@ def ui_grades():
     sub_name = st.selectbox("Asignatura", subjects["name"])
     sub_id = int(subjects.loc[subjects["name"]==sub_name,"id"].iloc[0])
 
-    # Evaluaciones de esa asignatura
     assessments = q("SELECT id, title, max_score FROM assessments WHERE subject_id=:s ORDER BY date ASC", {"s":sub_id})
     if assessments.empty:
         st.info("Crea evaluaciones para esta asignatura.")
@@ -234,7 +274,6 @@ def ui_grades():
     aid = int(assessments.loc[assessments["title"]==assess_title,"id"].iloc[0])
     max_sc = float(assessments.loc[assessments["title"]==assess_title,"max_score"].iloc[0])
 
-    # Estudiantes matriculados en esa asignatura y año
     enrolls = q("""
         SELECT e.id AS enrollment_id, st.first_name||' '||st.last_name AS estudiante
         FROM enrollments e
@@ -282,6 +321,8 @@ def ui_grades():
 
 def ui_reports():
     st.header("Informe para apoderado")
+    min_note, pass_pct, max_note = get_scale()
+
     years = q("SELECT DISTINCT year FROM enrollments ORDER BY year DESC")
     if years.empty:
         st.info("Registra matrículas primero.")
@@ -302,7 +343,6 @@ def ui_reports():
     s_name = st.selectbox("Estudiante", students["nombre"])
     s_id = int(students.loc[students["nombre"]==s_name,"id"].iloc[0])
 
-    # Notas del estudiante por asignatura
     df = q("""
         SELECT su.name AS asignatura, a.title, a.max_score, a.weight, g.score
         FROM grades g
@@ -324,25 +364,146 @@ def ui_reports():
           .reset_index(name="prom_ponderado")
     )
     por_asignatura["prom_ponderado_%"] = (por_asignatura["prom_ponderado"]*100).round(2)
-
-    promedio_general = round((por_asignatura["prom_ponderado"].mean()*100), 2)
+    por_asignatura["nota_chilena"] = por_asignatura["prom_ponderado_%"].apply(
+        lambda p: pct_to_chilean(p, min_note, pass_pct, max_note)
+    )
+    promedio_general_nota = round(
+        por_asignatura["nota_chilena"].mean(), 1
+    )
 
     st.subheader(f"Informe {s_name} - {yr}")
-    st.write(f"**Promedio general:** {promedio_general}%")
-    st.dataframe(por_asignatura[["asignatura","prom_ponderado_%"]]
-                 .rename(columns={"asignatura":"Asignatura","prom_ponderado_%":"Promedio (%)"}),
-                 use_container_width=True)
+    st.write(f"**Promedio general (nota): {promedio_general_nota}**")
+    st.dataframe(
+        por_asignatura[["asignatura","prom_ponderado_%","nota_chilena"]]
+            .rename(columns={"asignatura":"Asignatura",
+                             "prom_ponderado_%":"Promedio (%)",
+                             "nota_chilena":"Nota (1–7)"}),
+        use_container_width=True
+    )
 
-    csv = por_asignatura[["asignatura","prom_ponderado_%"]].to_csv(index=False).encode("utf-8")
+    csv = por_asignatura[["asignatura","prom_ponderado_%","nota_chilena"]]\
+        .rename(columns={"asignatura":"Asignatura","prom_onderado_%":"Promedio (%)","nota_chilena":"Nota (1–7)"}).to_csv(index=False).encode("utf-8")
     st.download_button("Descargar informe (CSV)", data=csv,
                        file_name=f"informe_{s_name.replace(' ','_')}_{yr}.csv", mime="text/csv")
+
+# --- Importación masiva ---
+def ui_import():
+    st.header("Importar planilla Excel → Curso + Matrículas + Asignaturas")
+    st.write("La planilla debe tener **dos hojas**: `estudiantes` y `asignaturas`.")
+    with st.expander("Descargar plantilla", expanded=False):
+        # Generar un .xlsx en memoria
+        tpl = io.BytesIO()
+        with pd.ExcelWriter(tpl, engine="openpyxl") as writer:
+            pd.DataFrame({
+                "run":["11111111-1","22222222-2"],
+                "first_name":["Ana","Luis"],
+                "last_name":["Pérez","Gómez"],
+                "email":["ana@example.com","luis@example.com"]
+            }).to_excel(writer, index=False, sheet_name="estudiantes")
+            pd.DataFrame({
+                "code":["MAT","LEN","HIS"],
+                "name":["Matemática","Lenguaje","Historia"]
+            }).to_excel(writer, index=False, sheet_name="asignaturas")
+        st.download_button("Descargar plantilla.xlsx", data=tpl.getvalue(),
+                           file_name="plantilla_importacion.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        course_name = st.text_input("Nombre del curso", value="7°B")
+        year = st.number_input("Año", min_value=2000, max_value=2100, value=date.today().year, step=1)
+    file = st.file_uploader("Sube el archivo .xlsx", type=["xlsx"])
+
+    if st.button("Procesar importación") and file:
+        try:
+            xls = pd.ExcelFile(file)
+            df_students = pd.read_excel(xls, "estudiantes").fillna("")
+            df_subjects = pd.read_excel(xls, "asignaturas").fillna("")
+        except Exception as e:
+            st.error(f"No se pudo leer el Excel: {e}")
+            return
+
+        # Validaciones básicas
+        need_s_cols = {"first_name","last_name"}
+        if not need_s_cols.issubset(set(map(str.lower, df_students.columns))):
+            st.error("Hoja 'estudiantes' debe tener columnas al menos: first_name, last_name (opcional: run, email).")
+            return
+        need_sub_cols = {"code","name"}
+        if not need_sub_cols.issubset(set(map(str.lower, df_subjects.columns))):
+            st.error("Hoja 'asignaturas' debe tener columnas: code, name.")
+            return
+
+        created_students = 0
+        created_subjects = 0
+        with engine.begin() as conn:
+            # Crear/obtener curso
+            conn.execute(text("""INSERT OR IGNORE INTO courses(name, year) VALUES(:n,:y)"""),
+                        {"n":course_name, "y":int(year)})
+            course_id = conn.execute(text("""SELECT id FROM courses WHERE name=:n AND year=:y"""),
+                                     {"n":course_name, "y":int(year)}).scalar()
+
+            # Asegurar asignaturas
+            for _, row in df_subjects.iterrows():
+                code = str(row["code"]).strip()
+                name = str(row["name"]).strip()
+                if not code or not name: continue
+                conn.execute(text("""INSERT OR IGNORE INTO subjects(code,name) VALUES(:c,:n)"""),
+                            {"c":code, "n":name})
+                subj_id = conn.execute(text("SELECT id FROM subjects WHERE code=:c"), {"c":code}).scalar()
+                # Vincular asignatura al curso
+                conn.execute(text("""INSERT OR IGNORE INTO course_subjects(course_id,subject_id)
+                                     VALUES(:cid,:sid)"""), {"cid":course_id, "sid":subj_id})
+                created_subjects += 1
+
+            # Cargar estudiantes y matricularlos al curso y a todas las asignaturas del curso
+            course_subjects = conn.execute(text("""SELECT subject_id FROM course_subjects WHERE course_id=:cid"""),
+                                           {"cid":course_id}).fetchall()
+            course_subjects = [r[0] for r in course_subjects]
+
+            for _, row in df_students.iterrows():
+                fn = str(row.get("first_name","")).strip()
+                ln = str(row.get("last_name","")).strip()
+                run = str(row.get("run","")).strip() or None
+                email = str(row.get("email","")).strip() or None
+                if not fn or not ln: continue
+
+                # Buscar por RUN o por (nombre+apellido+email)
+                sid = None
+                if run:
+                    sid = conn.execute(text("SELECT id FROM students WHERE run=:r"), {"r":run}).scalar()
+                if not sid and email:
+                    sid = conn.execute(text("""SELECT id FROM students
+                                               WHERE lower(email)=lower(:e)"""), {"e":email}).scalar()
+                if not sid:
+                    # Crear estudiante
+                    conn.execute(text("""INSERT INTO students(run,first_name,last_name,email,created_at)
+                                         VALUES(:r,:f,:l,:e,:c)"""),
+                                 {"r":run, "f":fn, "l":ln, "e":email, "c":datetime.utcnow().isoformat()})
+                    sid = conn.execute(text("SELECT last_insert_rowid()")).scalar()
+                    created_students += 1
+
+                # Vincular estudiante al curso
+                conn.execute(text("""INSERT OR IGNORE INTO student_courses(student_id,course_id)
+                                     VALUES(:s,:c)"""), {"s":sid, "c":course_id})
+
+                # Matricular en cada asignatura del curso para ese año
+                for subj_id in course_subjects:
+                    conn.execute(text("""INSERT OR IGNORE INTO enrollments(student_id,subject_id,year)
+                                         VALUES(:s,:u,:y)"""),
+                                 {"s":sid, "u":subj_id, "y":int(year)})
+
+        st.success(f"Importación completada. Estudiantes nuevos: {created_students}. Asignaturas procesadas: {created_subjects}.")
+        st.info(f"Curso: {course_name} — Año: {year}. Todos los estudiantes quedaron matriculados en las asignaturas del curso.")
 
 def main():
     st.set_page_config(page_title="Plataforma Escolar - MVP", layout="wide")
     ensure_tables()
     st.sidebar.title("Plataforma Escolar - MVP")
-    page = st.sidebar.radio("Ir a", ["Estudiantes","Asignaturas","Matrículas","Evaluaciones","Notas","Informes"], index=0)
-    if page=="Estudiantes":
+    st.sidebar.caption("Configura escala chilena en esta barra lateral.")
+
+    page = st.sidebar.radio("Ir a", ["Importar","Estudiantes","Asignaturas","Matrículas","Evaluaciones","Notas","Informes"], index=0)
+    if page=="Importar":
+        ui_import()
+    elif page=="Estudiantes":
         ui_students()
     elif page=="Asignaturas":
         ui_subjects()
